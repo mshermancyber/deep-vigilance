@@ -1,0 +1,254 @@
+name: 'Deep Vigilance Security Scan'
+description: 'Run a security scan via the Deep Vigilance platform and gate the build on findings.'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  api-url:
+    description: 'Base URL of the Deep Vigilance API (e.g. https://dv.example.com)'
+    required: true
+  api-email:
+    description: 'Email for API authentication'
+    required: true
+  api-password:
+    description: 'Password for API authentication'
+    required: true
+  project-id:
+    description: 'UUID of the project to scan'
+    required: true
+  scan-type:
+    description: 'Scan type: sast, dast, api, sca, full'
+    required: false
+    default: 'full'
+  fail-on:
+    description: 'Minimum severity to fail on: critical, high, medium, low, none'
+    required: false
+    default: 'high'
+  timeout:
+    description: 'Maximum seconds to wait for scan completion'
+    required: false
+    default: '600'
+  branch:
+    description: 'Git branch to scan (defaults to current ref)'
+    required: false
+    default: ''
+
+outputs:
+  scan-id:
+    description: 'UUID of the launched scan'
+    value: ${{ steps.launch.outputs.scan_id }}
+  findings-total:
+    description: 'Total number of findings'
+    value: ${{ steps.evaluate.outputs.total }}
+  findings-critical:
+    description: 'Number of critical findings'
+    value: ${{ steps.evaluate.outputs.critical }}
+  findings-high:
+    description: 'Number of high findings'
+    value: ${{ steps.evaluate.outputs.high }}
+  status:
+    description: 'Scan completion status'
+    value: ${{ steps.poll.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        for cmd in curl jq; do
+          if ! command -v "$cmd" &>/dev/null; then
+            echo "::error::Required command '$cmd' not found"
+            exit 1
+          fi
+        done
+        case "${{ inputs.scan-type }}" in
+          sast|dast|api|sca|full) ;;
+          *) echo "::error::Invalid scan-type '${{ inputs.scan-type }}'"; exit 1 ;;
+        esac
+        case "${{ inputs.fail-on }}" in
+          critical|high|medium|low|none) ;;
+          *) echo "::error::Invalid fail-on '${{ inputs.fail-on }}'"; exit 1 ;;
+        esac
+
+    - name: Login to Deep Vigilance
+      id: login
+      shell: bash
+      run: |
+        COOKIE_JAR="$(mktemp)"
+        echo "cookie_jar=${COOKIE_JAR}" >> "$GITHUB_OUTPUT"
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X POST "${{ inputs.api-url }}/api/auth/login" \
+          -H "Content-Type: application/json" \
+          -c "${COOKIE_JAR}" \
+          -d "{\"email\":\"${{ inputs.api-email }}\",\"password\":\"${{ inputs.api-password }}\"}")
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::error::Login failed with HTTP ${HTTP_CODE}"
+          exit 1
+        fi
+
+        if ! grep -q "access_token" "${COOKIE_JAR}"; then
+          echo "::error::Login succeeded but no access_token cookie received"
+          exit 1
+        fi
+
+        echo "::debug::Login successful"
+
+    - name: Launch scan
+      id: launch
+      shell: bash
+      run: |
+        COOKIE_JAR="${{ steps.login.outputs.cookie_jar }}"
+        BRANCH="${{ inputs.branch }}"
+        if [ -z "$BRANCH" ]; then
+          BRANCH="${GITHUB_REF_NAME}"
+        fi
+        REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+
+        PAYLOAD=$(jq -n \
+          --arg pid "${{ inputs.project-id }}" \
+          --arg st "${{ inputs.scan-type }}" \
+          --arg name "CI Scan - ${GITHUB_REPOSITORY}@${GITHUB_SHA:0:8}" \
+          --arg repo "$REPO_URL" \
+          --arg branch "$BRANCH" \
+          '{
+            projectId: $pid,
+            scanType: $st,
+            name: $name,
+            options: { repoUrl: $repo, branch: $branch }
+          }')
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" \
+          -X POST "${{ inputs.api-url }}/api/scans/launch" \
+          -H "Content-Type: application/json" \
+          -b "${COOKIE_JAR}" \
+          -d "$PAYLOAD")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+          echo "::error::Scan launch failed (HTTP ${HTTP_CODE}): ${BODY}"
+          exit 1
+        fi
+
+        SCAN_ID=$(echo "$BODY" | jq -r '.id // .scanId // .data.id // empty')
+        if [ -z "$SCAN_ID" ]; then
+          echo "::error::Could not extract scan ID from response: ${BODY}"
+          exit 1
+        fi
+
+        echo "scan_id=${SCAN_ID}" >> "$GITHUB_OUTPUT"
+        echo "::notice::Scan launched: ${SCAN_ID}"
+
+    - name: Poll for completion
+      id: poll
+      shell: bash
+      run: |
+        COOKIE_JAR="${{ steps.login.outputs.cookie_jar }}"
+        SCAN_ID="${{ steps.launch.outputs.scan_id }}"
+        TIMEOUT=${{ inputs.timeout }}
+        ELAPSED=0
+        INTERVAL=10
+
+        echo "Waiting for scan ${SCAN_ID} to complete (timeout: ${TIMEOUT}s)..."
+
+        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          RESPONSE=$(curl -s \
+            -b "${COOKIE_JAR}" \
+            "${{ inputs.api-url }}/api/scans/${SCAN_ID}")
+
+          STATUS=$(echo "$RESPONSE" | jq -r '.status // .data.status // empty')
+
+          case "$STATUS" in
+            completed)
+              echo "status=completed" >> "$GITHUB_OUTPUT"
+              echo "::notice::Scan completed successfully"
+              exit 0
+              ;;
+            failed)
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Scan failed"
+              exit 1
+              ;;
+            cancelled)
+              echo "status=cancelled" >> "$GITHUB_OUTPUT"
+              echo "::error::Scan was cancelled"
+              exit 1
+              ;;
+          esac
+
+          echo "  Status: ${STATUS} (${ELAPSED}s / ${TIMEOUT}s)"
+          sleep "$INTERVAL"
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+
+        echo "status=timeout" >> "$GITHUB_OUTPUT"
+        echo "::error::Scan timed out after ${TIMEOUT}s (last status: ${STATUS})"
+        exit 1
+
+    - name: Evaluate findings
+      id: evaluate
+      shell: bash
+      run: |
+        COOKIE_JAR="${{ steps.login.outputs.cookie_jar }}"
+        SCAN_ID="${{ steps.launch.outputs.scan_id }}"
+        FAIL_ON="${{ inputs.fail-on }}"
+
+        # Fetch all findings for this scan
+        RESPONSE=$(curl -s \
+          -b "${COOKIE_JAR}" \
+          "${{ inputs.api-url }}/api/findings?scanId=${SCAN_ID}&limit=200")
+
+        FINDINGS=$(echo "$RESPONSE" | jq '.data // []')
+
+        # Count by severity
+        CRITICAL=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "critical")] | length')
+        HIGH=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "high")] | length')
+        MEDIUM=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "medium")] | length')
+        LOW=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "low")] | length')
+        INFO=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "info")] | length')
+        TOTAL=$(echo "$FINDINGS" | jq 'length')
+
+        echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+        echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+        echo "high=${HIGH}" >> "$GITHUB_OUTPUT"
+        echo "medium=${MEDIUM}" >> "$GITHUB_OUTPUT"
+        echo "low=${LOW}" >> "$GITHUB_OUTPUT"
+
+        echo ""
+        echo "===== Deep Vigilance Scan Results ====="
+        echo "  Critical: ${CRITICAL}"
+        echo "  High:     ${HIGH}"
+        echo "  Medium:   ${MEDIUM}"
+        echo "  Low:      ${LOW}"
+        echo "  Info:     ${INFO}"
+        echo "  Total:    ${TOTAL}"
+        echo "========================================"
+        echo ""
+
+        # Determine if we should fail
+        SHOULD_FAIL=0
+        case "$FAIL_ON" in
+          critical) [ "$CRITICAL" -gt 0 ] && SHOULD_FAIL=1 ;;
+          high)     [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] && SHOULD_FAIL=1 ;;
+          medium)   [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] && SHOULD_FAIL=1 ;;
+          low)      [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] || [ "$LOW" -gt 0 ] && SHOULD_FAIL=1 ;;
+          none)     SHOULD_FAIL=0 ;;
+        esac
+
+        if [ "$SHOULD_FAIL" -eq 1 ]; then
+          echo "::error::Security gate failed — findings at or above '${FAIL_ON}' severity detected"
+          exit 1
+        fi
+
+        echo "::notice::Security gate passed (threshold: ${FAIL_ON})"
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f "${{ steps.login.outputs.cookie_jar }}" 2>/dev/null || true

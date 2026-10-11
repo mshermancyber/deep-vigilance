@@ -1,0 +1,247 @@
+// Deep Vigilance Security Scan - Jenkins Declarative Pipeline
+//
+// Usage: Reference this Jenkinsfile in a pipeline job, or copy the stages
+// into your project's existing Jenkinsfile.
+//
+// Required credentials (Jenkins Credentials Store):
+//   dv-credentials  - Username/Password credential (email / password)
+//
+// Pipeline parameters:
+//   API_URL      - Base URL of the Deep Vigilance API
+//   PROJECT_ID   - UUID of the project to scan
+//   SCAN_TYPE    - sast | dast | api | sca | full
+//   FAIL_ON      - critical | high | medium | low | none
+//   TIMEOUT      - Max seconds to wait for scan completion
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'API_URL',    defaultValue: '', description: 'Deep Vigilance API base URL')
+        string(name: 'PROJECT_ID', defaultValue: '', description: 'Project UUID in Deep Vigilance')
+        choice(name: 'SCAN_TYPE',  choices: ['full', 'sast', 'dast', 'api', 'sca'], description: 'Type of security scan')
+        choice(name: 'FAIL_ON',    choices: ['high', 'critical', 'medium', 'low', 'none'], description: 'Severity threshold to fail the build')
+        string(name: 'TIMEOUT',    defaultValue: '600', description: 'Max seconds to wait for scan completion')
+    }
+
+    environment {
+        COOKIE_JAR = "${WORKSPACE}/.dv-cookies"
+    }
+
+    stages {
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.API_URL?.trim()) {
+                        error('API_URL parameter is required')
+                    }
+                    if (!params.PROJECT_ID?.trim()) {
+                        error('PROJECT_ID parameter is required')
+                    }
+                }
+                sh 'which curl || (echo "curl is required" && exit 1)'
+                sh 'which jq || (echo "jq is required" && exit 1)'
+            }
+        }
+
+        stage('Login') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dv-credentials',
+                    usernameVariable: 'DV_EMAIL',
+                    passwordVariable: 'DV_PASSWORD'
+                )]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                            -X POST "${API_URL}/api/auth/login" \
+                            -H "Content-Type: application/json" \
+                            -c "${COOKIE_JAR}" \
+                            -d "{\\"email\\":\\"${DV_EMAIL}\\",\\"password\\":\\"${DV_PASSWORD}\\"}")
+
+                        if [ "$HTTP_CODE" != "200" ]; then
+                            echo "ERROR: Login failed with HTTP ${HTTP_CODE}"
+                            exit 1
+                        fi
+
+                        if ! grep -q "access_token" "${COOKIE_JAR}"; then
+                            echo "ERROR: No access_token cookie received"
+                            exit 1
+                        fi
+
+                        echo "Login successful."
+                    '''
+                }
+            }
+        }
+
+        stage('Launch Scan') {
+            steps {
+                script {
+                    def repoUrl = scm?.userRemoteConfigs?.getAt(0)?.getUrl() ?: env.GIT_URL ?: ''
+                    def branch  = env.GIT_BRANCH ?: env.BRANCH_NAME ?: 'main'
+                    env.DV_REPO_URL = repoUrl
+                    env.DV_BRANCH   = branch
+                }
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    SCAN_NAME="Jenkins Scan - ${JOB_NAME}#${BUILD_NUMBER}"
+
+                    PAYLOAD=$(jq -n \
+                        --arg pid "${PROJECT_ID}" \
+                        --arg st "${SCAN_TYPE}" \
+                        --arg name "$SCAN_NAME" \
+                        --arg repo "${DV_REPO_URL}" \
+                        --arg branch "${DV_BRANCH}" \
+                        '{
+                            projectId: $pid,
+                            scanType: $st,
+                            name: $name,
+                            options: { repoUrl: $repo, branch: $branch }
+                        }')
+
+                    RESPONSE=$(curl -s -w "\\n%{http_code}" \
+                        -X POST "${API_URL}/api/scans/launch" \
+                        -H "Content-Type: application/json" \
+                        -b "${COOKIE_JAR}" \
+                        -d "$PAYLOAD")
+
+                    HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                    BODY=$(echo "$RESPONSE" | sed '$d')
+
+                    if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+                        echo "ERROR: Scan launch failed (HTTP ${HTTP_CODE}): ${BODY}"
+                        exit 1
+                    fi
+
+                    SCAN_ID=$(echo "$BODY" | jq -r '.id // .scanId // .data.id // empty')
+                    if [ -z "$SCAN_ID" ]; then
+                        echo "ERROR: Could not extract scan ID"
+                        exit 1
+                    fi
+
+                    echo "$SCAN_ID" > "${WORKSPACE}/dv-scan-id.txt"
+                    echo "Scan launched: ${SCAN_ID}"
+                '''
+            }
+        }
+
+        stage('Poll Status') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    SCAN_ID=$(cat "${WORKSPACE}/dv-scan-id.txt")
+                    ELAPSED=0
+                    INTERVAL=10
+                    STATUS=""
+
+                    echo "Waiting for scan ${SCAN_ID} to complete..."
+
+                    while [ "$ELAPSED" -lt "${TIMEOUT}" ]; do
+                        RESPONSE=$(curl -s -b "${COOKIE_JAR}" "${API_URL}/api/scans/${SCAN_ID}")
+                        STATUS=$(echo "$RESPONSE" | jq -r '.status // .data.status // empty')
+
+                        case "$STATUS" in
+                            completed)
+                                echo "Scan completed."
+                                exit 0
+                                ;;
+                            failed)
+                                echo "ERROR: Scan failed"
+                                exit 1
+                                ;;
+                            cancelled)
+                                echo "ERROR: Scan was cancelled"
+                                exit 1
+                                ;;
+                        esac
+
+                        echo "  Status: ${STATUS} (${ELAPSED}s / ${TIMEOUT}s)"
+                        sleep "$INTERVAL"
+                        ELAPSED=$((ELAPSED + INTERVAL))
+                    done
+
+                    echo "ERROR: Scan timed out after ${TIMEOUT}s"
+                    exit 1
+                '''
+            }
+        }
+
+        stage('Evaluate Results') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    SCAN_ID=$(cat "${WORKSPACE}/dv-scan-id.txt")
+
+                    RESPONSE=$(curl -s -b "${COOKIE_JAR}" \
+                        "${API_URL}/api/findings?scanId=${SCAN_ID}&limit=200")
+
+                    FINDINGS=$(echo "$RESPONSE" | jq '.data // []')
+
+                    # Save full findings as artifact
+                    echo "$FINDINGS" > "${WORKSPACE}/dv-findings.json"
+
+                    CRITICAL=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "critical")] | length')
+                    HIGH=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "high")] | length')
+                    MEDIUM=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "medium")] | length')
+                    LOW=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "low")] | length')
+                    INFO=$(echo "$FINDINGS" | jq '[.[] | select(.severity == "info")] | length')
+                    TOTAL=$(echo "$FINDINGS" | jq 'length')
+
+                    # Save summary
+                    jq -n \
+                        --arg scan_id "$SCAN_ID" \
+                        --argjson critical "$CRITICAL" \
+                        --argjson high "$HIGH" \
+                        --argjson medium "$MEDIUM" \
+                        --argjson low "$LOW" \
+                        --argjson info "$INFO" \
+                        --argjson total "$TOTAL" \
+                        '{scan_id: $scan_id, critical: $critical, high: $high, medium: $medium, low: $low, info: $info, total: $total}' \
+                        > "${WORKSPACE}/dv-summary.json"
+
+                    echo ""
+                    echo "===== Deep Vigilance Scan Results ====="
+                    echo "  Critical: ${CRITICAL}"
+                    echo "  High:     ${HIGH}"
+                    echo "  Medium:   ${MEDIUM}"
+                    echo "  Low:      ${LOW}"
+                    echo "  Info:     ${INFO}"
+                    echo "  Total:    ${TOTAL}"
+                    echo "========================================"
+
+                    SHOULD_FAIL=0
+                    case "${FAIL_ON}" in
+                        critical) [ "$CRITICAL" -gt 0 ] && SHOULD_FAIL=1 ;;
+                        high)     [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] && SHOULD_FAIL=1 ;;
+                        medium)   [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] && SHOULD_FAIL=1 ;;
+                        low)      [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] || [ "$LOW" -gt 0 ] && SHOULD_FAIL=1 ;;
+                        none)     SHOULD_FAIL=0 ;;
+                    esac
+
+                    if [ "$SHOULD_FAIL" -eq 1 ]; then
+                        echo ""
+                        echo "FAILED: Findings at or above '${FAIL_ON}' severity detected"
+                        exit 1
+                    fi
+
+                    echo ""
+                    echo "PASSED: No findings at or above '${FAIL_ON}' severity"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'dv-findings.json,dv-summary.json', allowEmptyArchive: true
+            sh "rm -f '${COOKIE_JAR}' 2>/dev/null || true"
+        }
+        failure {
+            echo 'Deep Vigilance security scan detected issues or failed to complete.'
+        }
+        success {
+            echo 'Deep Vigilance security scan passed.'
+        }
+    }
+}
