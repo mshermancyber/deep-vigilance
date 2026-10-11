@@ -1,0 +1,12 @@
+# fp-github-actions.yml: GitHub Actions with pinned commit SHA — SAFE
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+      - name: Build
+        run: |
+          echo "Branch: ${{ github.ref_name }}"
+          make build

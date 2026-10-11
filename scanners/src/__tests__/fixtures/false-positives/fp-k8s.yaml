@@ -1,0 +1,12 @@
+# fp-k8s.yaml: ConfigMap resource — secure, no containers, no privileged
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app: myapp
+data:
+  config.yaml: |
+    server:
+      port: 8080
+      host: localhost

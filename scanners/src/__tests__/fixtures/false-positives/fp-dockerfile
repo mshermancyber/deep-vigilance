@@ -1,0 +1,8 @@
+# fp-dockerfile: Dockerfile with non-root USER — SAFE
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y nginx
+RUN useradd -m -s /bin/bash appuser
+COPY ./app /var/www/app
+RUN chown -R appuser:appuser /var/www/app
+USER appuser
+EXPOSE 8080
