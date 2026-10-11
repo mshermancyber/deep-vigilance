@@ -1,0 +1,49 @@
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+
+RUN npm ci --ignore-scripts
+
+COPY . .
+
+ARG CONFIGURATION=production
+RUN npm run build -- --configuration=${CONFIGURATION} --output-path=dist
+
+FROM nginx:1.25-alpine AS runtime
+
+RUN apk add --no-cache curl tini
+
+RUN rm -rf /usr/share/nginx/html/*
+
+# Angular 18 emits the app under dist/browser/ — serve that as the web root.
+COPY --from=builder /app/dist/browser /usr/share/nginx/html
+
+COPY nginx-frontend.conf /etc/nginx/conf.d/default.conf
+
+COPY frontend-health.sh /usr/local/bin/healthcheck
+RUN chmod +x /usr/local/bin/healthcheck
+
+RUN addgroup -g 1001 appsec && \
+    adduser -u 1001 -G appsec -s /bin/sh -D appsec && \
+    chown -R appsec:appsec /usr/share/nginx/html && \
+    chown -R appsec:appsec /var/cache/nginx && \
+    chown -R appsec:appsec /var/log/nginx && \
+    chmod -R 755 /usr/share/nginx/html && \
+    # Run nginx fully as non-root: pid in a writable path and drop the no-op
+    # `user` directive (the master isn't privileged so it can't setuid workers).
+    sed -i 's|pid .*;|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf && \
+    sed -i '/^\s*user\s/d' /etc/nginx/nginx.conf
+
+HEALTHCHECK --interval=20s --timeout=10s --retries=5 --start-period=30s \
+    CMD /usr/local/bin/healthcheck
+
+EXPOSE 8080
+
+USER appsec
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["nginx", "-g", "daemon off;"]

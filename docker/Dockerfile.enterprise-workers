@@ -1,0 +1,49 @@
+FROM node:20-alpine AS builder
+RUN apk add --no-cache python3 make g++ git
+WORKDIR /app
+COPY scanners/package.json scanners/package-lock.json* ./
+COPY scanners/tsconfig.json ./
+COPY scanners/src ./src
+COPY shared /shared
+RUN npm ci --ignore-scripts && npm run build && npm prune --production
+
+FROM node:20-alpine AS runtime
+
+# Pinned scanner tool versions (bump deliberately; install scripts verify checksums).
+# NOTE: these must be REAL published release tags — a nonexistent tag makes the
+# upstream installer find the version via the API but 404 on the asset download.
+ARG TRIVY_VERSION=0.70.0
+ARG SYFT_VERSION=1.18.1
+ARG APKTOOL_VERSION=2.10.0
+
+RUN apk add --no-cache curl bash tini ca-certificates chromium font-noto-cjk openjdk17-jre-headless \
+ && addgroup -g 1001 appsec && adduser -u 1001 -G appsec -s /bin/sh -D appsec
+
+# Trivy (container CVE scanner) — official installer pins version + verifies checksums
+RUN curl --retry 3 --retry-delay 2 -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+      | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}" \
+ && trivy --version
+
+# Syft (SBOM generator) — official installer pins version + verifies checksums
+RUN curl --retry 3 --retry-delay 2 -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+      | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}" \
+ && syft version
+
+# apktool (APK decoder) — wrapper + pinned jar
+RUN curl --retry 3 --retry-delay 2 -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /usr/local/bin/apktool.jar \
+ && curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -o /usr/local/bin/apktool \
+ && chmod +x /usr/local/bin/apktool \
+ && apktool --version
+
+# Trivy vulnerability DB cache (mount a volume here so it persists across restarts)
+ENV TRIVY_CACHE_DIR=/cache/trivy
+RUN mkdir -p /cache/trivy && chown -R appsec:appsec /cache
+
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+RUN chown -R appsec:appsec /app
+USER appsec
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/enterprise-worker.js"]

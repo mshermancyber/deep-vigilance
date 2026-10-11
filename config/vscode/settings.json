@@ -1,0 +1,310 @@
+{
+  // =============================================================================
+  // AppSec Platform — VS Code Workspace Settings
+  // M14d: Developer Experience — IDE Configuration
+  // =============================================================================
+
+  // ---------------------------------------------------------------------------
+  // Editor Settings
+  // ---------------------------------------------------------------------------
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.renderWhitespace": "boundary",
+  "editor.rulers": [80, 100, 120],
+  "editor.bracketPairColorization.enabled": true,
+  "editor.guides.bracketPairs": true,
+  "editor.cursorBlinking": "smooth",
+  "editor.minimap.enabled": true,
+  "editor.minimap.scale": 2,
+  "editor.suggestSelection": "first",
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "editor.wordWrap": "off",
+  "editor.autoClosingBrackets": "always",
+  "editor.autoClosingQuotes": "always",
+  "editor.trimAutoWhitespace": true,
+
+  // ---------------------------------------------------------------------------
+  // Code Actions on Save
+  // ---------------------------------------------------------------------------
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit",
+    "source.fixAll.eslint": "explicit",
+    "source.fixAll.ts": "explicit",
+    "source.fixAll.stylelint": "explicit",
+    "source.addMissingImports": "explicit",
+    "source.removeUnusedImports": "explicit"
+  },
+
+  // ---------------------------------------------------------------------------
+  // Files Configuration
+  // ---------------------------------------------------------------------------
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.git": true,
+    "**/.svn": true,
+    "**/.hg": true,
+    "**/CVS": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true,
+    "**/__pycache__": true,
+    "**/.next": true,
+    "**/.nuxt": true,
+    "**/.venv": true,
+    "**/venv": true,
+    "**/.nyc_output": true,
+    "**/coverage": true,
+    "**/.angular": true,
+    "**/.vite": true,
+    "**/.cache": true,
+    "**/.tmp": true,
+    "**/tmp": true,
+    "**/target": true,
+    "**/bin": true,
+    "**/obj": true,
+    "**/out": true,
+    "**/logs": true,
+    "**/vendor": true,
+    "**/*.min.js": true,
+    "**/*.min.css": true,
+    "**/*.bundle.js": true,
+    "**/*.bundle.css": true
+  },
+
+  // ---------------------------------------------------------------------------
+  // Search Configuration
+  // ---------------------------------------------------------------------------
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.git": true,
+    "**/coverage": true,
+    "**/.nyc_output": true,
+    "**/__pycache__": true,
+    "**/.venv": true,
+    "**/venv": true,
+    "**/.next": true,
+    "**/.nuxt": true,
+    "**/.angular": true,
+    "**/.vite": true,
+    "**/target": true,
+    "**/bin": true,
+    "**/obj": true,
+    "**/out": true,
+    "**/logs": true,
+    "**/vendor": true,
+    "**/reports": true,
+    "**/data": true,
+    "**/certs": true,
+    "**/package-lock.json": true,
+    "**/yarn.lock": true,
+    "**/pnpm-lock.yaml": true,
+    "**/*.min.js": true,
+    "**/*.min.css": true,
+    "**/*.map": true,
+    "**/*.bundle.js": true,
+    "**/*.bundle.css": true,
+    "**/scanners/node_modules": true,
+    "**/backend/node_modules": true,
+    "**/frontend/node_modules": true,
+    "**/workers/node_modules": true
+  },
+
+  // ---------------------------------------------------------------------------
+  // Files: Encoding, Watchers, Associations
+  // ---------------------------------------------------------------------------
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.trimTrailingWhitespace": true,
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.angular/**": true,
+    "**/.vite/**": true,
+    "**/coverage/**": true,
+    "**/reports/**": true,
+    "**/data/**": true,
+    "**/certs/**": true
+  },
+  "files.associations": {
+    ".env.sample": "dotenv",
+    ".env.*": "dotenv",
+    "Dockerfile.*": "dockerfile",
+    ".dockerignore": "ignore",
+    ".prettierrc": "json",
+    ".stylelintrc": "json",
+    ".appsec.yml": "yaml",
+    ".appsec-precommit.yml": "yaml",
+    ".appsec-baseline.json": "json",
+    "*.tsx": "typescriptreact",
+    "*.jsx": "javascriptreact"
+  },
+
+  // ---------------------------------------------------------------------------
+  // TypeScript / JavaScript
+  // ---------------------------------------------------------------------------
+  "typescript.preferences.quoteStyle": "single",
+  "typescript.preferences.importModuleSpecifier": "relative",
+  "typescript.suggest.autoImports": true,
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "javascript.preferences.quoteStyle": "single",
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  "javascript.validate.enable": true,
+  "javascript.suggestionActions.enabled": true,
+
+  // ---------------------------------------------------------------------------
+  // ESLint
+  // ---------------------------------------------------------------------------
+  "eslint.validate": [
+    "javascript",
+    "javascriptreact",
+    "typescript",
+    "typescriptreact",
+    "vue",
+    "html"
+  ],
+  "eslint.workingDirectories": [
+    { "pattern": "./backend/" },
+    { "pattern": "./frontend/" },
+    { "pattern": "./scanners/" },
+    { "pattern": "./workers/" }
+  ],
+  "eslint.codeActionsOnSave.mode": "all",
+  "eslint.lintTask.enable": true,
+  "eslint.debug": false,
+
+  // ---------------------------------------------------------------------------
+  // Prettier
+  // ---------------------------------------------------------------------------
+  "prettier.requireConfig": true,
+  "prettier.singleQuote": true,
+  "prettier.trailingComma": "all",
+  "prettier.printWidth": 120,
+  "prettier.tabWidth": 2,
+  "prettier.semi": true,
+  "prettier.arrowParens": "always",
+  "prettier.endOfLine": "lf",
+
+  // ---------------------------------------------------------------------------
+  // Docker
+  // ---------------------------------------------------------------------------
+  "docker.containers.label": "ComposeProjectName",
+  "docker.composeBuildImages": "auto",
+  "docker.dockerPath": "/usr/bin/docker",
+  "docker.showStartPage": false,
+
+  // ---------------------------------------------------------------------------
+  // Git
+  // ---------------------------------------------------------------------------
+  "git.enableSmartCommit": true,
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  "git.inputValidationSubjectLength": 72,
+  "git.mergeEditor": true,
+
+  // ---------------------------------------------------------------------------
+  // Terminal
+  // ---------------------------------------------------------------------------
+  "terminal.integrated.defaultLocation": "editor",
+  "terminal.integrated.fontSize": 13,
+  "terminal.integrated.lineHeight": 1.2,
+  "terminal.integrated.cursorBlinking": true,
+  "terminal.integrated.cursorStyle": "line",
+  "terminal.integrated.scrollback": 10000,
+  "terminal.integrated.shellIntegration.enabled": true,
+
+  // ---------------------------------------------------------------------------
+  // Workbench / UI
+  // ---------------------------------------------------------------------------
+  "workbench.startupEditor": "none",
+  "workbench.colorTheme": "Default Dark Modern",
+  "workbench.iconTheme": "material-icon-theme",
+  "workbench.sideBar.location": "left",
+  "workbench.tree.indent": 20,
+
+  // ---------------------------------------------------------------------------
+  // Extensions
+  // ---------------------------------------------------------------------------
+  "extensions.ignoreRecommendations": false,
+
+  // ---------------------------------------------------------------------------
+  // Debugging
+  // ---------------------------------------------------------------------------
+  "debug.showInStatusBar": "always",
+  "debug.internalConsoleOptions": "openOnSessionStart",
+  "debug.terminal.clearBeforeReusing": true,
+
+  // ---------------------------------------------------------------------------
+  // Emmet
+  // ---------------------------------------------------------------------------
+  "emmet.includeLanguages": {
+    "typescriptreact": "html",
+    "javascriptreact": "html",
+    "vue-html": "html"
+  },
+
+  // ---------------------------------------------------------------------------
+  // HTTP / Files
+  // ---------------------------------------------------------------------------
+  "http.proxySupport": "off",
+  "http.systemCertificates": false,
+
+  // ---------------------------------------------------------------------------
+  // Security / Privacy
+  // ---------------------------------------------------------------------------
+  "security.workspace.trust.untrustedFiles": "open",
+  "telemetry.telemetryLevel": "off",
+
+  // ---------------------------------------------------------------------------
+  // Angular (specific to frontend)
+  // ---------------------------------------------------------------------------
+  "[html]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.suggest.insertMode": "replace"
+  },
+  "angular.enable-experimental-ivy-prompt": false,
+
+  // ---------------------------------------------------------------------------
+  // Markdown
+  // ---------------------------------------------------------------------------
+  "[markdown]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.wordWrap": "wordWrapColumn",
+    "editor.wordWrapColumn": 80,
+    "editor.quickSuggestions": false,
+    "editor.snippetSuggestions": "none"
+  },
+
+  // ---------------------------------------------------------------------------
+  // YAML
+  // ---------------------------------------------------------------------------
+  "[yaml]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2,
+    "editor.autoIndent": "advanced"
+  },
+
+  // ---------------------------------------------------------------------------
+  // JSON
+  // ---------------------------------------------------------------------------
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.quickSuggestions": {
+      "strings": true
+    }
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  }
+}

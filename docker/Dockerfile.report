@@ -1,0 +1,24 @@
+FROM node:20-alpine AS builder
+RUN apk add --no-cache python3 make g++ git
+WORKDIR /app
+COPY workers/package.json workers/package-lock.json* ./
+COPY workers/tsconfig.json ./
+COPY workers/src ./src
+COPY shared /shared
+RUN npm ci --ignore-scripts && npm run build && npm prune --production
+
+FROM node:20-alpine AS runtime
+RUN apk add --no-cache curl tini ca-certificates chromium font-noto-cjk && \
+    addgroup -g 1001 appsec && adduser -u 1001 -G appsec -s /bin/sh -D appsec
+# Use the system Chromium (deps build with --ignore-scripts, so puppeteer's
+# bundled browser is never downloaded).
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+WORKDIR /app
+RUN mkdir -p /app/reports && chown -R appsec:appsec /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+USER appsec
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/report-worker.js"]

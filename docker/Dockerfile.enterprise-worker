@@ -1,0 +1,76 @@
+# Enterprise Worker Dockerfile
+# Multi-stage build for container-scan, binary-scan, sbom-generation,
+# apiprotocol-scan, and dast-enterprise workers.
+#
+# The master entry point (enterprise-worker.ts) registers all five BullMQ
+# workers and is the single process launched at runtime.
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 make g++ git curl
+
+WORKDIR /app
+
+# Copy dependency manifests first for layer caching
+COPY scanners/package.json scanners/package-lock.json* ./
+COPY scanners/tsconfig.json ./
+COPY shared/ /shared/
+
+# Install ALL dependencies (including devDependencies needed for build)
+RUN npm ci --ignore-scripts
+
+# Copy source
+COPY scanners/src ./src
+
+# Build TypeScript
+RUN npm run build
+
+# Prune dev dependencies for smaller runtime image
+RUN npm prune --production
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM node:20-alpine AS runtime
+
+RUN apk add --no-cache \
+    curl \
+    tini \
+    ca-certificates \
+    chromium \
+    font-noto-cjk \
+    && addgroup -g 1001 appsec \
+    && adduser -u 1001 -G appsec -s /bin/sh -D appsec
+
+WORKDIR /app
+
+# Copy compiled output and production dependencies
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+# Copy shared types if needed at runtime
+COPY --from=builder /shared/ /shared/
+
+# Security hardening
+RUN chown -R appsec:appsec /app && \
+    chmod -R 550 /app/dist
+
+# Health check — verify the Node process is alive and able to respond
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 --start-period=40s \
+    CMD node -e " \
+      const http = require('http'); \
+      const req = http.get('http://localhost:3000/health', (res) => { \
+        process.exit(res.statusCode === 200 ? 0 : 1); \
+      }); \
+      req.on('error', () => process.exit(1)); \
+      req.setTimeout(5000, () => { req.destroy(); process.exit(1); }); \
+    " || exit 1
+
+USER appsec
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/enterprise-worker.js"]

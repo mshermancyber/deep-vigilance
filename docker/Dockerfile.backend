@@ -1,0 +1,44 @@
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 make g++ git curl
+
+WORKDIR /app
+
+COPY backend/package.json backend/package-lock.json* backend/tsconfig.json ./
+COPY backend/src ./src
+COPY backend/tests ./tests
+
+RUN npm ci --ignore-scripts && \
+    npm run build && \
+    npm prune --production
+
+FROM node:20-alpine AS runtime
+
+RUN apk add --no-cache curl tini ca-certificates && \
+    addgroup -g 1001 appsec && \
+    adduser -u 1001 -G appsec -s /bin/sh -D appsec
+
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+COPY certs /app/certs
+COPY scripts/init /app/scripts/init
+COPY scripts/health /app/scripts/health
+
+RUN chown -R appsec:appsec /app && \
+    chmod -R 550 /app/dist && \
+    chmod -R 550 /app/scripts
+
+USER appsec
+
+# Backend runs HTTP on the private network; TLS terminates at the nginx edge.
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 --start-period=40s \
+    CMD node -e "require('http').request({hostname:'localhost',port:3000,path:'/api/health'},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>process.exit(r.statusCode===200?0:1))}).on('error',()=>process.exit(1)).end()"
+
+EXPOSE 3000 3001
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/server.js"]
