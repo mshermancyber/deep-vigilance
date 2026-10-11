@@ -1,0 +1,525 @@
+x-common-backend: &common-backend
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.backend
+  restart: unless-stopped
+  environment: &backend-env
+    NODE_ENV: production
+    DB_HOST: postgres
+    DB_PORT: 5432
+    DB_NAME: appsec_platform
+    DB_USER: appsec_user
+    DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (>=32 chars, unique)}
+    JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET must be set (>=32 chars, unique)}
+    ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set (exactly 32 chars)}
+    API_PORT: 3000
+    WS_PORT: 3001
+    # `*` reflects the request origin so the app works from any host/IP (localhost,
+    # a private-network address, a phone). Front it with a firewall. Set a comma-separated
+    # origin list to pin it to real hostnames.
+    CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    RATE_LIMIT_WINDOW_MS: 900000
+    RATE_LIMIT_MAX_REQUESTS: 1000
+    SMTP_HOST: ${SMTP_HOST:-mailhog}
+    SMTP_PORT: ${SMTP_PORT:-1025}
+    SMTP_USER: ${SMTP_USER:-}
+    SMTP_PASS: ${SMTP_PASS:-}
+    SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+    CHROMIUM_URL: http://chromium:9222
+    SCANNER_API_URL: https://backend:3000
+    REPORT_DIR: ${REPORT_DIR:-/data/reports}
+    # Allow scanners to target private/LAN/loopback hosts (self-hosted internal scanning).
+    # Metadata/link-local are always blocked regardless. Default off; firewall the stack.
+    ALLOW_PRIVATE_SCAN_TARGETS: ${ALLOW_PRIVATE_SCAN_TARGETS:-false}
+    FRAUDVAULT_URL: ${FRAUDVAULT_URL:-}
+    FRAUDVAULT_EMAIL: ${FRAUDVAULT_EMAIL:-}
+    FRAUDVAULT_PASSWORD: ${FRAUDVAULT_PASSWORD:-}
+    SBOM_VISUALIZER_URL: ${SBOM_VISUALIZER_URL:-}
+    SBOM_VISUALIZER_TOKEN: ${SBOM_VISUALIZER_TOKEN:-}
+    # AI finding triage. Optional: with no key set, every AI endpoint falls back
+    # to the local heuristic engine. OPENAI_* is the documented pair; the generic
+    # AI_* names are aliases for any other OpenAI-compatible endpoint.
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_API_URL: ${OPENAI_API_URL:-}
+    OPENAI_MODEL: ${OPENAI_MODEL:-}
+    AI_API_URL: ${AI_API_URL:-}
+    AI_API_KEY: ${AI_API_KEY:-}
+    AI_MODEL: ${AI_MODEL:-}
+    NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-0}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - appsec-internal
+    - appsec-public
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: appsec_platform
+      POSTGRES_USER: appsec_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./postgres/seeds:/docker-entrypoint-initdb.d/seeds:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d/init:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appsec_user -d appsec_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - appsec-internal
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - appsec-internal
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  backend:
+    <<: *common-backend
+    container_name: appsec-backend
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    # No host ports — API (3000) and WebSocket (3001) are reached only through the
+    # nginx edge over the internal network. No localhost bypass of TLS/edge controls.
+    volumes:
+      # Migrations applied automatically on startup (runMigrations) read from here.
+      - ./postgres/migrations:/app/postgres/migrations:ro
+      # Report files: the report-worker writes <id>.<format> into reports_data,
+      # the /reports/:id/download route serves them, and the retention job
+      # (core/cleanup.ts) unlinks them — so this mount must be writable.
+      - reports_data:${REPORT_DIR:-/data/reports}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').request({hostname:'localhost',port:3000,path:'/api/health'},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>process.exit(r.statusCode===200?0:1))}).on('error',()=>process.exit(1)).end()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # NOTE: the old `backend-worker` (dist/workers/main.js) was removed — it registered
+  # STUB sast-scan/dast-scan BullMQ workers (performStaticAnalysis returned []; DAST
+  # did nothing) that raced and beat the real scanner containers, marking every scan
+  # "completed" with 0 findings. Real scanning is handled by the *-worker services below.
+
+  sast-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sast
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - sast_rules:/app/rules:ro
+      # Local-filesystem scanning: host code mounted read-only at /scan. Point
+      # SCAN_SOURCE_DIR at the code you want to scan (defaults to ./scan-sources).
+      - ${SCAN_SOURCE_DIR:-./scan-sources}:/scan:ro
+    networks:
+      # Egress so SAST can clone git repos (DNS + outbound). Local-FS scans don't
+      # need it, but the worker is shared.
+      - appsec-internal
+      - appsec-public
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4'
+        reservations:
+          memory: 1G
+          cpus: '1'
+
+  dast-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dast
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+      CHROMIUM_WS_URL: ws://chromium:3000?token=${CHROMIUM_TOKEN:?CHROMIUM_TOKEN must be set}
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromium:
+        condition: service_started
+    networks:
+      # appsec-public is a normal (non-internal) bridge → outbound egress so DAST
+      # can reach external scan targets. appsec-internal keeps redis/pg private.
+      - appsec-internal
+      - appsec-public
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4'
+        reservations:
+          memory: 1G
+          cpus: '1'
+
+  api-scanner-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api-scanner
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - appsec-internal
+      - appsec-public
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  enterprise-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.enterprise-workers
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      chromium:
+        condition: service_started
+    volumes:
+      - sast_rules:/app/rules:ro
+      - trivy_cache:/cache/trivy
+      - ${SCAN_SOURCE_DIR:-./scan-sources}:/scan:ro
+    networks:
+      - appsec-internal
+      - appsec-public
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4'
+        reservations:
+          memory: 1G
+          cpus: '1'
+
+  report-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.report
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - reports_data:${REPORT_DIR:-/data/reports}
+    networks:
+      - appsec-internal
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  code-review-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.code-review
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      # egress for git clone; internal for redis/postgres
+      - appsec-internal
+      - appsec-public
+    volumes:
+      - ${SCAN_SOURCE_DIR:-./scan-sources}:/scan:ro
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  sca-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sca
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      DB_HOST: ${DB_HOST:-postgres}
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+      VULN_FEEDS_URL: ${VULN_FEEDS_URL:-http://vuln-feeds:9000}
+      VULN_FEEDS_API_KEY: ${VULN_FEEDS_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - appsec-internal
+      - appsec-public
+    volumes:
+      - ${SCAN_SOURCE_DIR:-./scan-sources}:/scan:ro
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  secret-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.secret
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      LOG_LEVEL: ${SCANNER_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - appsec-internal
+      - appsec-public
+    volumes:
+      - ${SCAN_SOURCE_DIR:-./scan-sources}:/scan:ro
+      # Foothold feed: container writes /data/exposed-creds.feed.json →
+      # host ./data/exposed-creds.feed.json, relative to the repository root.
+      - ./data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  chromium:
+    image: browserless/chrome:latest
+    restart: unless-stopped
+    environment:
+      CONNECTION_TIMEOUT: 600000
+      MAX_CONCURRENT_SESSIONS: 10
+      # Launch Chrome per-session and reap it on close — no idle preboot pool.
+      # (PREBOOT_CHROME+KEEP_ALIVE kept 10 warm Chromes = ~70 idle processes.)
+      PREBOOT_CHROME: "false"
+      KEEP_ALIVE: "false"
+      TOKEN: ${CHROMIUM_TOKEN:?CHROMIUM_TOKEN must be set}
+    # No host port — reached only over the internal network at chromium:3000.
+    networks:
+      - appsec-internal
+    healthcheck:
+      # browserless gates every endpoint behind the token; /pressure is the
+      # documented liveness probe. Token env var inside the container is TOKEN.
+      test: ["CMD-SHELL", "curl -fsS \"http://localhost:3000/pressure?token=$$TOKEN\" >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4'
+        reservations:
+          memory: 1G
+          cpus: '1'
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      args:
+        CONFIGURATION: production
+    restart: unless-stopped
+    # No host ports — the SPA is served only through the nginx edge (frontend:8080
+    # over the internal network). No localhost bypass.
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - appsec-public
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/cache:/var/cache/nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - appsec-public
+    healthcheck:
+      test: ["CMD", "curl", "-fk", "https://localhost/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "${SMTP_DEV_PORT:-1025}:1025"
+      - "${MAILHOG_UI_PORT:-8025}:8025"
+    networks:
+      - appsec-internal
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/data/postgres
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/data/redis
+  sast_rules:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/scanners/sast/rules
+  reports_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PWD}/data/reports
+  trivy_cache:
+    driver: local
+
+networks:
+  appsec-internal:
+    driver: bridge
+    internal: true
+    driver_opts:
+      encrypted: "true"
+  appsec-public:
+    driver: bridge

@@ -1,0 +1,1 @@
+Self-hosted application security platform. SAST across 25+ languages, DAST with a headless-Chromium crawler, API security testing, SCA with EPSS/KEV enrichment, and secret scanning — unified into one vulnerability queue with RBAC, scheduling, SARIF/PDF reporting, and a synchronous single-file endpoint for editors and CI.

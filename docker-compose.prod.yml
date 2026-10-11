@@ -1,0 +1,804 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Production Override — docker-compose.prod.yml
+# ═══════════════════════════════════════════════════════════════════════════
+# Apply alongside the base file:
+#
+#   Docker Compose (Swarm required for overlay / secrets):
+#     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+#   Docker Stack (Swarm mode):
+#     docker swarm init
+#     docker secret create db_password   ./secrets/db_password.txt
+#     docker secret create redis_password ./secrets/redis_password.txt
+#     docker secret create jwt_secret    ./secrets/jwt_secret.txt
+#     docker stack deploy -c docker-compose.yml -c docker-compose.prod.yml appsec
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Shared Logging Anchor ─────────────────────────────────────────────────
+# Applied to every service below.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+
+# ── Services ──────────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────
+  postgres:
+    logging: *logging
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+
+    # Read PostgreSQL credentials from a Docker secret.
+    # The official postgres image supports the _FILE suffix natively.
+    environment:
+      POSTGRES_PASSWORD: ""                              # Cleared – use secret
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appsec_user -d appsec_platform"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      placement:
+        constraints:
+          - node.labels.role == database
+
+  # ── Redis ───────────────────────────────────────────────────────────────
+  redis:
+    logging: *logging
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+
+    # Redis does not natively support the _FILE env-var convention,
+    # so we wrap the server command to export the password from the secret.
+    secrets:
+      - redis_password
+    environment:
+      REDIS_PASSWORD: ""                                 # Cleared – set below
+    command: >
+      /bin/sh -c
+      "export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && exec redis-server
+      --requirepass $$REDIS_PASSWORD
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000"
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "$$REDIS_PASSWORD", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      placement:
+        constraints:
+          - node.labels.role == cache
+
+  # ── Backend API ─────────────────────────────────────────────────────────
+  backend:
+    # NOTE: container_name (set in base file) limits this service to
+    # replicas: 1.  To scale >1, remove `container_name` from the base
+    # docker-compose.yml — Docker Swarm generates unique names per replica.
+
+    logging: *logging
+
+    # Run as non-root user 1001 (appsec user created in Dockerfile.backend).
+    # Read-only root with writable /tmp for Node.js temp files.
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+
+    volumes:
+      # Startup migration-runner reads from here (read-only respects read_only root).
+      - ./postgres/migrations:/app/postgres/migrations:ro
+
+    # Read secrets at runtime by exporting them before starting the app.
+    # The ENTRYPOINT (tini) runs the shell wrapper below, which sets
+    # environment variables from mounted secret files, then execs the app.
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$$(cat /run/secrets/jwt_secret)
+      && exec node dist/server.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('https').request({hostname:'localhost',port:3000,path:'/api/health',rejectUnauthorized:false},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>process.exit(r.statusCode===200?0:1))}).end()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── Backend Worker removed ──────────────────────────────────────────────
+  # It ran stub sast-scan/dast-scan processors (dist/workers/main.js) that raced
+  # and beat the real scanner services, marking every scan completed with 0
+  # findings. Real scanning is handled by the dedicated *-worker services.
+
+  # ── SAST Worker ─────────────────────────────────────────────────────────
+  sast-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$$(cat /run/secrets/jwt_secret)
+      && exec node dist/sast-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 10s
+        max_attempts: 3
+        window: 180s
+
+  # ── DAST Worker ─────────────────────────────────────────────────────────
+  dast-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Chromium/Playwright needs extra capabilities for browser sandboxing.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SYS_PTRACE
+      - NET_BIND_SERVICE
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$$(cat /run/secrets/jwt_secret)
+      && exec node dist/dast-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 10s
+        max_attempts: 3
+        window: 180s
+
+  # ── API Scanner Worker ──────────────────────────────────────────────────
+  api-scanner-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$$(cat /run/secrets/jwt_secret)
+      && exec node dist/api-scanner-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── Enterprise Worker ───────────────────────────────────────────────────
+  enterprise-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # This worker spawns Chromium for DAST/enterprise scans.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SYS_PTRACE
+      - NET_BIND_SERVICE
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$$(cat /run/secrets/jwt_secret)
+      && exec node dist/enterprise-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 10s
+        max_attempts: 3
+        window: 180s
+
+  # ── Report Worker ───────────────────────────────────────────────────────
+  report-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$(cat /run/secrets/jwt_secret)
+      && exec node dist/report-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── Secret Worker ───────────────────────────────────────────────────────
+  secret-worker:
+    logging: *logging
+
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=256M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+
+    secrets:
+      - db_password
+      - redis_password
+      - jwt_secret
+    environment:
+      LOG_LEVEL: warn
+    command: >
+      /bin/sh -c
+      "export DB_PASSWORD=$(cat /run/secrets/db_password)
+      && export REDIS_PASSWORD=$(cat /run/secrets/redis_password)
+      && export JWT_SECRET=$(cat /run/secrets/jwt_secret)
+      && exec node dist/secret-worker.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── Chromium / browserless ──────────────────────────────────────────────
+  chromium:
+    logging: *logging
+
+    # browserless/chrome normally runs as root for Chrome sandbox.
+    # We do NOT force user: 1001 here because Chrome requires root
+    # for its sandbox (or --no-sandbox, which is a security trade-off).
+    # Instead we drop capabilities to the minimum Chrome needs.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:docker/default
+    cap_drop:
+      - ALL
+    cap_add:
+      # Chrome's sandbox needs user-namespace + ptrace; it does not need to
+      # chown/own arbitrary files, so CHOWN/FOWNER are dropped.
+      - NET_BIND_SERVICE
+      - SYS_PTRACE
+      - SETUID
+      - SETGID
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512M
+      - /dev/shm:noexec,nosuid,size=256M
+
+    environment:
+      LOG_LEVEL: warn
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 30s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 10s
+        max_attempts: 3
+        window: 180s
+
+  # ── Frontend (SPA served by nginx) ──────────────────────────────────────
+  frontend:
+    logging: *logging
+
+    # The Dockerfile.frontend creates user 1001 (appsec) and already
+    # runs via `USER appsec`.  With read-only root we mount tmpfs for
+    # the directories nginx needs to write to (cache, logs, pid).
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=128M
+      - /var/cache/nginx:noexec,nosuid,size=64M
+      - /var/log/nginx:noexec,nosuid,size=64M
+      - /var/run:noexec,nosuid,size=16M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Non-root nginx needs NET_BIND_SERVICE to bind to port 80.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── NGINX Reverse Proxy ─────────────────────────────────────────────────
+  nginx:
+    logging: *logging
+
+    # The main nginx runs as root (for binding ports 80/443) but drops
+    # to the nginx user for worker processes.  We keep the default user
+    # but lock down capabilities so it has only what it needs.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+
+    healthcheck:
+      test: ["CMD", "curl", "-fk", "https://localhost/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # ── MailHog ─────────────────────────────────────────────────────────────
+  mailhog:
+    logging: *logging
+
+    # MailHog is a Go binary with no file-system writes beyond /tmp.
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64M
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8025/api/v2/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    deploy:
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 15s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 0s
+        order: stop-first
+      restart_policy:
+        condition: unless-stopped
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+
+# ── Docker Secrets ────────────────────────────────────────────────────────
+# In Swarm mode, create secrets before deploying:
+#   docker secret create db_password   ./secrets/db_password.txt
+#   docker secret create redis_password ./secrets/redis_password.txt
+#   docker secret create jwt_secret    ./secrets/jwt_secret.txt
+#
+# For local compose testing (non-Swarm), replace `external: true` with
+# `file:` pointing to plain-text secret files:
+#   file: ./secrets/db_password.txt
+# ───────────────────────────────────────────────────────────────────────────
+secrets:
+  db_password:
+    external: true
+  redis_password:
+    external: true
+  jwt_secret:
+    external: true
+
+
+# ── Volumes ───────────────────────────────────────────────────────────────
+# Production paths are static (not ${PWD}-relative) so the volume
+# survives container restarts regardless of working directory.
+# ───────────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/appsec/postgres
+    # NFS-backed alternative (uncomment and adjust for your NAS / SAN):
+    # driver: local
+    # driver_opts:
+    #   type: nfs
+    #   o: addr=10.0.0.10,rw,nfsvers=4.2,soft,timeo=600,retrans=3,noatime
+    #   device: :/exports/appsec/postgres
+
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/appsec/redis
+
+  sast_rules:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/appsec/sast-rules
+
+  reports_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/appsec/reports
+
+
+# ── Networks ──────────────────────────────────────────────────────────────
+# Overlay driver is required for Swarm multi-node deployments.
+# `attachable: true` allows standalone containers (e.g. one-off tasks)
+# to connect to the overlay.
+# The internal network is encrypted at the overlay layer.
+# ───────────────────────────────────────────────────────────────────────────
+networks:
+  appsec-internal:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+    attachable: true
+
+  appsec-public:
+    driver: overlay
+    attachable: true
