@@ -1,0 +1,11 @@
+# tp-github-actions.yml: Script injection via event payload in run:
+name: Script Injection
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Issue title: ${{ github.event.issue.title }}"

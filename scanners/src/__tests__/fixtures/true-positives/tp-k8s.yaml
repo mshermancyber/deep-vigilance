@@ -1,0 +1,11 @@
+# tp-k8s.yaml: Kubernetes pod with privileged: true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: privileged-pod
+spec:
+  containers:
+    - name: app
+      image: myapp:latest
+      securityContext:
+        privileged: true
